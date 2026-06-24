@@ -29,6 +29,14 @@ from . import refine as _refine_module
 from . import modify as _modify_module
 from . import adapt as _adapt_module
 from . import split as _split_module
+# Registers refine.context_budget and exposes OptimizableAttachments.
+from . import optimize as _optimize_module
+from .optimize import (
+    OptimizableAttachments,
+    context_budget,
+    estimate_tokens,
+    keyword_coverage_metric,
+)
 
 # Create the namespace instances after functions are registered
 load = SmartVerbNamespace(_loaders, 'load')
@@ -87,7 +95,13 @@ __all__ = [
     'attach',
     'A',
     'Pipeline',
-    
+
+    # Self-optimizing context pipelines + smart budgeting
+    'OptimizableAttachments',
+    'context_budget',
+    'estimate_tokens',
+    'keyword_coverage_metric',
+
     # Config
     'config',
     'set_verbose',
