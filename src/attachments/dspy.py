@@ -489,4 +489,150 @@ def _register_types_for_dspy():
 
 
 # Automatically register types when module is imported
-_register_types_for_dspy() 
+_register_types_for_dspy()
+
+
+# ===========================================================================
+# Optimizable context as a first-class DSPy module
+# ===========================================================================
+# Lets the context-construction step live *inside* a DSPy program. The
+# settings that build the context (format, truncate, budget, ...) become a
+# tunable parameter that `ContextOptimizer` searches against a metric — the
+# same "let the optimizer pick, not the human" move DSPy applies to prompts,
+# applied one layer earlier. Compose with MIPROv2: tune the predictors' prompts
+# with MIPROv2, tune the ingestion config with ContextOptimizer.
+
+def _create_attachment_context_class():
+    """Build the AttachmentContext dspy.Module (only if dspy is available)."""
+    if not _check_dspy_availability():
+        return None
+
+    import dspy
+    from .optimize import OptimizableAttachments, estimate_tokens
+
+    class AttachmentContext(dspy.Module):
+        """A DSPy module that turns file path(s) into model-ready context.
+
+        Drop it into any dspy program as the ingestion step::
+
+            class RAG(dspy.Module):
+                def __init__(self):
+                    self.ingest = AttachmentContext("report.pdf")
+                    self.answer = dspy.ChainOfThought("context, question -> answer")
+                def forward(self, question):
+                    ctx = self.ingest().context
+                    return self.answer(context=ctx, question=question)
+
+        The context-construction choices live in ``self.config`` and are tuned
+        by :class:`ContextOptimizer` against a metric.
+        """
+
+        def __init__(self, *paths, config=None, search_space=None):
+            super().__init__()
+            self.paths = tuple(paths)
+            self.config = dict(config) if config else {}
+            self.search_space = search_space
+            # An internal searcher used for rendering and candidate enumeration.
+            self._opt = (
+                OptimizableAttachments(*paths, search_space=search_space)
+                if paths
+                else None
+            )
+            if self._opt is not None and self.search_space is None:
+                self.search_space = self._opt.search_space
+
+        def forward(self, paths=None, **kwargs):
+            use_paths = tuple(paths) if paths else self.paths
+            opt = OptimizableAttachments(*use_paths, search_space=self.search_space)
+            context = opt.render(config=self.config)
+            return dspy.Prediction(
+                context=context,
+                config=dict(self.config),
+                tokens=estimate_tokens(context),
+            )
+
+        def candidates(self, max_trials=32):
+            if self._opt is None:
+                return [{}]
+            return self._opt.candidates(max_trials=max_trials)
+
+    return AttachmentContext
+
+
+def _create_context_optimizer_class():
+    """Build the ContextOptimizer teleprompter (only if dspy is available)."""
+    if not _check_dspy_availability():
+        return None
+
+    import copy
+
+    class ContextOptimizer:
+        """A DSPy-style teleprompter that tunes an AttachmentContext's config.
+
+        Usage mirrors DSPy optimizers::
+
+            tuned = ContextOptimizer(metric=m).compile(student, trainset=examples)
+
+        It searches the module's candidate configs and keeps the one with the
+        best average metric over the trainset. ``metric`` follows the DSPy
+        convention ``metric(example, prediction) -> float``; a one-argument
+        ``metric(context_text)`` is also accepted for quick offline use.
+        """
+
+        def __init__(self, metric, max_trials=32, verbose=False):
+            self.metric = metric
+            self.max_trials = max_trials
+            self.verbose = verbose
+
+        def _score(self, example, prediction):
+            try:
+                return float(self.metric(example, prediction))
+            except TypeError:
+                return float(self.metric(prediction.context))
+
+        def compile(self, student, trainset=None):
+            examples = list(trainset) if trainset else [None]
+            best_cfg, best_score = dict(student.config), float("-inf")
+            for cfg in student.candidates(max_trials=self.max_trials):
+                trial = copy.deepcopy(student)
+                trial.config = cfg
+                scores = []
+                for ex in examples:
+                    inputs = {}
+                    if ex is not None and hasattr(ex, "inputs"):
+                        try:
+                            inputs = dict(ex.inputs())
+                        except Exception:
+                            inputs = {}
+                    scores.append(self._score(ex, trial(**inputs)))
+                avg = sum(scores) / len(scores)
+                if self.verbose:
+                    print(f"  config {cfg} -> {avg:.4f}")
+                if avg > best_score:
+                    best_score, best_cfg = avg, cfg
+            tuned = copy.deepcopy(student)
+            tuned.config = best_cfg
+            tuned._compiled_score = best_score
+            return tuned
+
+    return ContextOptimizer
+
+
+# Materialize the classes (None if dspy is unavailable, matching this module's
+# existing graceful-degradation pattern).
+AttachmentContext = _create_attachment_context_class()
+ContextOptimizer = _create_context_optimizer_class()
+
+# Re-export the framework-agnostic optimizer for convenience.
+try:
+    from .optimize import OptimizableAttachments, keyword_coverage_metric
+except Exception:  # pragma: no cover - optimize has no hard deps, but be safe
+    OptimizableAttachments = None
+    keyword_coverage_metric = None
+
+__all__ = __all__ + [
+    'AttachmentContext',
+    'ContextOptimizer',
+    'OptimizableAttachments',
+    'keyword_coverage_metric',
+]
